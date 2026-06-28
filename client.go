@@ -43,7 +43,7 @@ func WithBearerToken(tok string) Option { return func(c *config) { c.bearer = to
 // WithBasicAuth sets HTTP basic auth on every request.
 func WithBasicAuth(u, p string) Option { return func(c *config) { c.user, c.pass = u, p } }
 
-// WithMaxRetries sets the retry budget for 5xx + transport errors (default 3).
+// WithMaxRetries sets the retry budget for 429 + 5xx + transport errors (default 3).
 // Retries are not idempotent-aware: a write whose response is lost in transit
 // (transport error or 5xx after the server applied it) may be re-sent, so a
 // retried CreateRun/LogMetric/LogBatch can double-write. This is acceptable
@@ -83,8 +83,9 @@ func NewClient(trackingURI string, opts ...Option) (*Client, error) {
 }
 
 // doRequest performs the URL build, auth, and retry loop, returning the final
-// response body and status. It retries 5xx and transport errors with exponential
-// backoff up to cfg.maxRetries; 4xx is returned immediately (no retry).
+// response body and status. It retries 429 and 5xx (and transport errors) up to
+// cfg.maxRetries, honoring Retry-After when present and using exponential backoff
+// otherwise; non-429 4xx is returned immediately (no retry).
 func doRequest(ctx context.Context, cfg config, base, method, path string, body []byte) ([]byte, int, error) {
 	url := base + "/api/2.0/mlflow/" + path
 	var lastErr error
