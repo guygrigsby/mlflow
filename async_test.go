@@ -11,14 +11,15 @@ import (
 
 // batchSink is a fakeClient transport that records every runs/log-batch call.
 type batchSink struct {
-	mu      sync.Mutex
-	calls   int32
-	metrics map[string][]Metric
-	params  map[string][]Param
-	tags    map[string][]RunTag
-	fail    func() error // optional: return an error from each call
-	gate    chan struct{} // optional: if non-nil, first call blocks until closed
-	gated   int32
+	mu         sync.Mutex
+	calls      int32
+	metrics    map[string][]Metric
+	params     map[string][]Param
+	tags       map[string][]RunTag
+	batchSizes []int    // records len(metrics)+len(params)+len(tags) per call
+	fail       func() error // optional: return an error from each call
+	gate       chan struct{} // optional: if non-nil, first call blocks until closed
+	gated      int32
 }
 
 func newBatchSink() *batchSink {
@@ -43,6 +44,7 @@ func (s *batchSink) client() *Client {
 		s.metrics[req.RunID] = append(s.metrics[req.RunID], req.Metrics...)
 		s.params[req.RunID] = append(s.params[req.RunID], req.Params...)
 		s.tags[req.RunID] = append(s.tags[req.RunID], req.Tags...)
+		s.batchSizes = append(s.batchSizes, len(req.Metrics)+len(req.Params)+len(req.Tags))
 		s.mu.Unlock()
 		if s.fail != nil {
 			return s.fail()
@@ -106,6 +108,57 @@ func TestAsyncLoggerPerRunBucketing(t *testing.T) {
 		if m.Key != "acc" {
 			t.Fatalf("runB got foreign metric %q", m.Key)
 		}
+	}
+}
+
+func TestAsyncLoggerBatchSizeCap(t *testing.T) {
+	s := newBatchSink()
+	// Hold the first flush so a burst piles up behind it.
+	s.gate = make(chan struct{})
+	a := s.client().NewAsyncLogger(WithBatchSize(10))
+	ctx := context.Background()
+	for i := 0; i < 95; i++ {
+		if err := a.LogMetric(ctx, "run1", "loss", float64(i), 0, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(s.gate)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.metricCount("run1"); got != 95 {
+		t.Fatalf("delivered %d, want 95", got)
+	}
+	// No single observed batch may exceed the cap.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sz := range s.batchSizes {
+		if sz > 10 {
+			t.Fatalf("batch of %d exceeds cap 10", sz)
+		}
+	}
+}
+
+func TestAsyncLoggerCoalescesBurst(t *testing.T) {
+	s := newBatchSink()
+	s.gate = make(chan struct{}) // stall worker on its first flush
+	a := s.client().NewAsyncLogger() // default batchSize 1000
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err := a.LogMetric(ctx, "run1", "loss", float64(i), 0, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(s.gate)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.metricCount("run1"); got != 100 {
+		t.Fatalf("delivered %d, want 100", got)
+	}
+	// 100 records must coalesce into a handful of batches, not ~100.
+	if c := atomic.LoadInt32(&s.calls); c > 5 {
+		t.Fatalf("expected coalesced batches, got %d log-batch calls", c)
 	}
 }
 

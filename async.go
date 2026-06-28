@@ -44,9 +44,11 @@ type AsyncOption func(*asyncConfig)
 // WithBufferSize sets the in-flight record channel capacity (default 8192).
 func WithBufferSize(n int) AsyncOption { return func(c *asyncConfig) { c.bufferSize = n } }
 
-// WithBatchSize caps records per flush, clamped to [1,1000] (default 1000, the
-// API limit). The greedy drain makes real batch size track traffic once the
-// size trigger is wired in (Task 4); until then this only sets the cap.
+// WithBatchSize caps total records (metrics + params + tags) per flush, clamped
+// to [1,1000] (default 1000, the API limit). The worker flushes a run's bucket
+// immediately when it reaches this cap; the greedy drain coalesces whatever is
+// already queued, so real batch sizes track traffic rather than firing one
+// record at a time.
 func WithBatchSize(n int) AsyncOption { return func(c *asyncConfig) { c.batchSize = n } }
 
 // WithErrorHandler is invoked once per failed background flush. Errors are also
@@ -140,6 +142,15 @@ func (a *AsyncLogger) run() {
 			flush(id)
 		}
 	}
+	// feed adds a record and flushes its run immediately once the bucket hits the
+	// cap, so no observed LogBatch call exceeds batchSize on any path (including
+	// the shutdown drain).
+	feed := func(rec record) {
+		add(rec)
+		if buckets[rec.runID].n >= a.cfg.batchSize {
+			flush(rec.runID)
+		}
+	}
 	for {
 		select {
 		case rec, ok := <-a.records:
@@ -147,9 +158,9 @@ func (a *AsyncLogger) run() {
 				flushAll()
 				return
 			}
-			add(rec)
+			feed(rec)
 		case <-a.closed:
-			a.drainAll(add)
+			a.drainAll(feed)
 			flushAll()
 			return
 		}
@@ -161,7 +172,7 @@ func (a *AsyncLogger) run() {
 					flushAll()
 					return
 				}
-				add(rec)
+				feed(rec)
 			default:
 				draining = false
 			}
