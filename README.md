@@ -85,6 +85,30 @@ The client is synchronous and best-effort: it retries transient failures (5xx an
 transport errors) with exponential backoff, never retries 4xx, and never buffers.
 Callers decide what to do on error.
 
+### Async batch logging
+
+For training loops that emit many metrics, `NewAsyncLogger` buffers writes and
+flushes them as `runs/log-batch` calls from a single background worker. It blocks
+only when the buffer is full (backpressure, never drops), batches per run, and
+coalesces bursts automatically. Flush failures go to `WithErrorHandler` and are
+also returned by `Close`.
+
+```go
+logger := client.NewAsyncLogger(
+    mlflow.WithErrorHandler(func(err error) { log.Printf("flush: %v", err) }),
+)
+defer logger.Close()
+
+for step := int64(0); step < n; step++ {
+    logger.LogMetric(ctx, runID, "loss", loss, ts, step)
+}
+```
+
+Options: `WithBufferSize` (channel capacity, default 8192), `WithBatchSize`
+(records per flush, default/maximum 1000), `WithErrorHandler`. Call `Flush(ctx)`
+to force a synchronous flush; `Close` flushes the remainder and returns the
+aggregate error.
+
 ## Errors
 
 Non-2xx responses map to `*mlflow.APIError` (`Code`, `Message`, `HTTPStatus`). Use
