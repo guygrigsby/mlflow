@@ -153,6 +153,7 @@ func (a *AsyncLogger) run() {
 			flushAll()
 			return
 		}
+		// greedy non-blocking drain, then flush once caught up
 		for draining := true; draining; {
 			select {
 			case rec, ok := <-a.records:
