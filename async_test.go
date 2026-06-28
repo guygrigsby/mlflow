@@ -201,6 +201,27 @@ func TestAsyncLoggerLogAfterCloseErrors(t *testing.T) {
 	}
 }
 
+func TestAsyncLoggerFlush(t *testing.T) {
+	s := newBatchSink()
+	a := s.client().NewAsyncLogger()
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		if err := a.LogMetric(ctx, "run1", "loss", float64(i), 0, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Flush(ctx); err != nil {
+		t.Fatalf("Flush = %v", err)
+	}
+	// Delivered without Close.
+	if got := s.metricCount("run1"); got != 5 {
+		t.Fatalf("after Flush delivered %d, want 5", got)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAsyncLoggerErrorHandlerAndAggregate(t *testing.T) {
 	s := newBatchSink()
 	s.fail = func() error { return errors.New("boom") }

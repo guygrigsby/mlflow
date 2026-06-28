@@ -59,11 +59,12 @@ func WithErrorHandler(h func(error)) AsyncOption { return func(c *asyncConfig) {
 // calls from a single background worker. Fire-and-forget: Log* methods enqueue
 // and return; flush failures surface via WithErrorHandler and Close.
 type AsyncLogger struct {
-	client  *Client
-	cfg     asyncConfig
-	records chan record
-	closed  chan struct{}
-	done    chan struct{}
+	client   *Client
+	cfg      asyncConfig
+	records  chan record
+	closed   chan struct{}
+	done     chan struct{}
+	flushReq chan chan struct{}
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -86,11 +87,12 @@ func (c *Client) NewAsyncLogger(opts ...AsyncOption) *AsyncLogger {
 		cfg.batchSize = 1000
 	}
 	a := &AsyncLogger{
-		client:  c,
-		cfg:     cfg,
-		records: make(chan record, cfg.bufferSize),
-		closed:  make(chan struct{}),
-		done:    make(chan struct{}),
+		client:   c,
+		cfg:      cfg,
+		records:  make(chan record, cfg.bufferSize),
+		closed:   make(chan struct{}),
+		done:     make(chan struct{}),
+		flushReq: make(chan chan struct{}),
 	}
 	go a.run()
 	return a
@@ -163,6 +165,11 @@ func (a *AsyncLogger) run() {
 			a.drainAll(feed)
 			flushAll()
 			return
+		case ack := <-a.flushReq:
+			a.drainAll(feed)
+			flushAll()
+			close(ack)
+			continue
 		}
 		// greedy non-blocking drain, then flush once caught up
 		for draining := true; draining; {
@@ -223,6 +230,28 @@ func (a *AsyncLogger) LogParam(ctx context.Context, runID, key, value string) er
 // SetTag enqueues a run tag. Blocking semantics match LogMetric.
 func (a *AsyncLogger) SetTag(ctx context.Context, runID, key, value string) error {
 	return a.send(ctx, record{runID: runID, kind: kindTag, tag: RunTag{Key: key, Value: value}})
+}
+
+// Flush force-flushes all records buffered at the time of the call and waits for
+// those batches to complete. Returns ctx.Err() if ctx is canceled while waiting,
+// ErrLoggerClosed if the logger is closed, otherwise the aggregate flush error so far.
+func (a *AsyncLogger) Flush(ctx context.Context) error {
+	ack := make(chan struct{})
+	select {
+	case a.flushReq <- ack:
+	case <-a.closed:
+		return ErrLoggerClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-ack:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return errors.Join(a.errs...)
 }
 
 // Close flushes buffered records, stops the worker, and returns the aggregate of
