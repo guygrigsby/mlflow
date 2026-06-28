@@ -3,6 +3,7 @@ package mlflow
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,44 @@ func TestAsyncLoggerCoalescesBurst(t *testing.T) {
 	// 100 records must coalesce into a handful of batches, not ~100.
 	if c := atomic.LoadInt32(&s.calls); c > 5 {
 		t.Fatalf("expected coalesced batches, got %d log-batch calls", c)
+	}
+}
+
+func TestAsyncLoggerCtxCancelWhenFull(t *testing.T) {
+	s := newBatchSink()
+	s.gate = make(chan struct{})
+	a := s.client().NewAsyncLogger(WithBufferSize(1))
+	ctx := context.Background()
+	// m0 gets pulled by the worker, which then blocks in its first (gated) flush.
+	if err := a.LogMetric(ctx, "run1", "loss", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the worker is parked inside the flush gate.
+	for atomic.LoadInt32(&s.gated) == 0 {
+		runtime.Gosched()
+	}
+	// Buffer (size 1) now empty; fill it.
+	if err := a.LogMetric(ctx, "run1", "loss", 1, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	// Next send must block; with a canceled ctx it returns promptly.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := a.LogMetric(cctx, "run1", "loss", 2, 0, 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled when full, got %v", err)
+	}
+	close(s.gate)
+	_ = a.Close()
+}
+
+func TestAsyncLoggerLogAfterCloseErrors(t *testing.T) {
+	s := newBatchSink()
+	a := s.client().NewAsyncLogger()
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.LogMetric(context.Background(), "run1", "loss", 0, 0, 0); !errors.Is(err, ErrLoggerClosed) {
+		t.Fatalf("want ErrLoggerClosed, got %v", err)
 	}
 }
 
