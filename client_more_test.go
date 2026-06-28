@@ -2,9 +2,11 @@ package mlflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -101,5 +103,121 @@ func TestWithHTTPClientIsUsed(t *testing.T) {
 	}
 	if !used {
 		t.Fatal("WithHTTPClient transport was not used")
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	base := time.Date(2025, 10, 21, 7, 28, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		in     string
+		now    time.Time
+		wantD  time.Duration
+		wantOK bool
+	}{
+		{"empty", "", base, 0, false},
+		{"seconds", "5", base, 5 * time.Second, true},
+		{"seconds with space", " 5 ", base, 5 * time.Second, true},
+		{"negative seconds clamps", "-3", base, 0, true},
+		{"http-date future", "Tue, 21 Oct 2025 07:28:30 GMT", base, 30 * time.Second, true},
+		{"http-date past clamps", "Tue, 21 Oct 2025 07:27:00 GMT", base, 0, true},
+		{"garbage", "soon", base, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d, ok := parseRetryAfter(c.in, c.now)
+			if ok != c.wantOK || d != c.wantD {
+				t.Fatalf("parseRetryAfter(%q) = %v,%v want %v,%v", c.in, d, ok, c.wantD, c.wantOK)
+			}
+		})
+	}
+}
+
+func TestRetryOn429ThenSuccess(t *testing.T) {
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL)
+	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err != nil {
+		t.Fatalf("want success after 429 retry, got %v", err)
+	}
+	if atomic.LoadInt32(&n) != 2 {
+		t.Fatalf("attempts = %d, want 2", n)
+	}
+}
+
+func TestRetryOn503(t *testing.T) {
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL)
+	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err != nil {
+		t.Fatalf("want success after 503 retry, got %v", err)
+	}
+	if atomic.LoadInt32(&n) != 2 {
+		t.Fatalf("attempts = %d, want 2", n)
+	}
+}
+
+func TestRetryAfterSecondsWaits(t *testing.T) {
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL)
+	start := time.Now()
+	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatalf("Retry-After: 1 should pause ~1s, waited %v", elapsed)
+	}
+}
+
+func TestNon429FourxxNotRetried(t *testing.T) {
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL)
+	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err == nil {
+		t.Fatal("want error on 400")
+	}
+	if atomic.LoadInt32(&n) != 1 {
+		t.Fatalf("400 must not retry, attempts = %d", n)
+	}
+}
+
+func TestCtxCancelDuringRetryAfterWait(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := c.do(ctx, http.MethodGet, "experiments/get", nil, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want context deadline error, got %v", err)
 	}
 }

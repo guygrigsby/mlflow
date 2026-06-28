@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -87,9 +88,15 @@ func NewClient(trackingURI string, opts ...Option) (*Client, error) {
 func doRequest(ctx context.Context, cfg config, base, method, path string, body []byte) ([]byte, int, error) {
 	url := base + "/api/2.0/mlflow/" + path
 	var lastErr error
+	var retryAfter time.Duration
+	var haveRetryAfter bool
 	for attempt := 0; attempt <= cfg.maxRetries; attempt++ {
 		if attempt > 0 {
 			d := time.Duration(math.Min(float64(time.Second)*math.Pow(2, float64(attempt-1)), float64(10*time.Second)))
+			if haveRetryAfter {
+				d = retryAfter
+				haveRetryAfter = false
+			}
 			select {
 			case <-time.After(d):
 			case <-ctx.Done():
@@ -114,12 +121,18 @@ func doRequest(ctx context.Context, cfg config, base, method, path string, body 
 			continue
 		}
 		data, _ := io.ReadAll(resp.Body)
+		ra, raOK := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		status := resp.StatusCode
 		resp.Body.Close()
-		if resp.StatusCode/100 == 5 {
-			lastErr = apiError(data, resp.StatusCode) // server error: retry
+		// Retry 429 (rate limited) and 5xx (includes 503). Everything else returns.
+		if status == http.StatusTooManyRequests || status/100 == 5 {
+			lastErr = apiError(data, status)
+			if raOK {
+				retryAfter, haveRetryAfter = ra, true
+			}
 			continue
 		}
-		return data, resp.StatusCode, nil
+		return data, status, nil
 	}
 	return nil, 0, lastErr
 }
@@ -165,4 +178,28 @@ func apiError(data []byte, status int) *APIError {
 		ae.Message = string(data)
 	}
 	return ae
+}
+
+// parseRetryAfter interprets a Retry-After header value in either form:
+// delta-seconds ("5") or an HTTP-date. It returns the wait clamped to >= 0 and
+// whether the header was present and parseable. now is injected for testing.
+func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			secs = 0
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
 }
