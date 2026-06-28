@@ -73,6 +73,42 @@ func TestAsyncLoggerFlushesOnClose(t *testing.T) {
 	}
 }
 
+func TestAsyncLoggerPerRunBucketing(t *testing.T) {
+	s := newBatchSink()
+	a := s.client().NewAsyncLogger()
+	ctx := context.Background()
+	for i := 0; i < 10; i++ {
+		if err := a.LogMetric(ctx, "runA", "loss", float64(i), 0, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.LogMetric(ctx, "runB", "acc", float64(i), 0, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.metricCount("runA"); got != 10 {
+		t.Fatalf("runA = %d, want 10", got)
+	}
+	if got := s.metricCount("runB"); got != 10 {
+		t.Fatalf("runB = %d, want 10", got)
+	}
+	// Each run's metrics must carry that run's key, never the other's.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.metrics["runA"] {
+		if m.Key != "loss" {
+			t.Fatalf("runA got foreign metric %q", m.Key)
+		}
+	}
+	for _, m := range s.metrics["runB"] {
+		if m.Key != "acc" {
+			t.Fatalf("runB got foreign metric %q", m.Key)
+		}
+	}
+}
+
 // Keep the compiler happy for fields used in later tasks.
 var _ = errors.New
 var _ = strings.Contains

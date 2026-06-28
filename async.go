@@ -105,21 +105,16 @@ func (a *AsyncLogger) recordErr(err error) {
 
 // run is the worker. It never waits on a clock: it blocks receiving the first
 // record, greedy-drains whatever else is queued, then flushes once it catches up.
+// Records are bucketed per run_id because runs/log-batch is per-run.
 func (a *AsyncLogger) run() {
 	defer close(a.done)
-	b := &bucket{}
-	curRun := ""
-	flush := func() {
-		if b.n == 0 {
-			return
-		}
-		if err := a.client.LogBatch(context.Background(), curRun, b.metrics, b.params, b.tags); err != nil {
-			a.recordErr(err)
-		}
-		b = &bucket{}
-	}
+	buckets := map[string]*bucket{}
 	add := func(rec record) {
-		curRun = rec.runID
+		b := buckets[rec.runID]
+		if b == nil {
+			b = &bucket{}
+			buckets[rec.runID] = b
+		}
 		switch rec.kind {
 		case kindMetric:
 			b.metrics = append(b.metrics, rec.metric)
@@ -130,25 +125,39 @@ func (a *AsyncLogger) run() {
 		}
 		b.n++
 	}
+	flush := func(runID string) {
+		b := buckets[runID]
+		if b == nil || b.n == 0 {
+			return
+		}
+		if err := a.client.LogBatch(context.Background(), runID, b.metrics, b.params, b.tags); err != nil {
+			a.recordErr(err)
+		}
+		delete(buckets, runID)
+	}
+	flushAll := func() {
+		for id := range buckets {
+			flush(id)
+		}
+	}
 	for {
 		select {
 		case rec, ok := <-a.records:
 			if !ok {
-				flush()
+				flushAll()
 				return
 			}
 			add(rec)
 		case <-a.closed:
 			a.drainAll(add)
-			flush()
+			flushAll()
 			return
 		}
-		// greedy non-blocking drain, then flush once caught up
 		for draining := true; draining; {
 			select {
 			case rec, ok := <-a.records:
 				if !ok {
-					flush()
+					flushAll()
 					return
 				}
 				add(rec)
@@ -156,7 +165,7 @@ func (a *AsyncLogger) run() {
 				draining = false
 			}
 		}
-		flush()
+		flushAll()
 	}
 }
 
