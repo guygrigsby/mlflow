@@ -201,6 +201,19 @@ func TestAsyncLoggerLogAfterCloseErrors(t *testing.T) {
 	}
 }
 
-// Keep the compiler happy for fields used in later tasks.
-var _ = errors.New
-var _ = strings.Contains
+func TestAsyncLoggerErrorHandlerAndAggregate(t *testing.T) {
+	s := newBatchSink()
+	s.fail = func() error { return errors.New("boom") }
+	var handled int32
+	a := s.client().NewAsyncLogger(WithErrorHandler(func(error) { atomic.AddInt32(&handled, 1) }))
+	if err := a.LogParam(context.Background(), "run1", "lr", "0.01"); err != nil {
+		t.Fatal(err)
+	}
+	err := a.Close()
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("Close aggregate = %v, want it to contain boom", err)
+	}
+	if atomic.LoadInt32(&handled) == 0 {
+		t.Fatal("error handler was never called")
+	}
+}

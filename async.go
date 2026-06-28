@@ -215,6 +215,16 @@ func (a *AsyncLogger) LogMetric(ctx context.Context, runID, key string, value fl
 	return a.send(ctx, record{runID: runID, kind: kindMetric, metric: Metric{Key: key, Value: value, Timestamp: tsMs, Step: step}})
 }
 
+// LogParam enqueues a param for the run. Blocking semantics match LogMetric.
+func (a *AsyncLogger) LogParam(ctx context.Context, runID, key, value string) error {
+	return a.send(ctx, record{runID: runID, kind: kindParam, param: Param{Key: key, Value: value}})
+}
+
+// SetTag enqueues a run tag. Blocking semantics match LogMetric.
+func (a *AsyncLogger) SetTag(ctx context.Context, runID, key, value string) error {
+	return a.send(ctx, record{runID: runID, kind: kindTag, tag: RunTag{Key: key, Value: value}})
+}
+
 // Close flushes buffered records, stops the worker, and returns the aggregate of
 // all flush errors. Idempotent. Callers must stop all Log* / Flush calls before
 // invoking Close: a Log* racing Close may enqueue a record the stopped worker
