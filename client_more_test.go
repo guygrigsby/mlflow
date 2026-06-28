@@ -122,6 +122,9 @@ func TestParseRetryAfter(t *testing.T) {
 		{"http-date future", "Tue, 21 Oct 2025 07:28:30 GMT", base, 30 * time.Second, true},
 		{"http-date past clamps", "Tue, 21 Oct 2025 07:27:00 GMT", base, 0, true},
 		{"garbage", "soon", base, 0, false},
+		// Values above maxRetryAfter are clamped so a hostile header cannot park the caller.
+		{"large seconds clamped", "100000", base, maxRetryAfter, true},
+		{"far-future http-date clamped", "Tue, 21 Oct 2025 09:28:00 GMT", base, maxRetryAfter, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -134,9 +137,9 @@ func TestParseRetryAfter(t *testing.T) {
 }
 
 func TestRetryOn429ThenSuccess(t *testing.T) {
-	var n int32
+	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&n, 1) == 1 {
+		if n.Add(1) == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
@@ -147,15 +150,15 @@ func TestRetryOn429ThenSuccess(t *testing.T) {
 	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err != nil {
 		t.Fatalf("want success after 429 retry, got %v", err)
 	}
-	if atomic.LoadInt32(&n) != 2 {
-		t.Fatalf("attempts = %d, want 2", n)
+	if n.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", n.Load())
 	}
 }
 
 func TestRetryOn503(t *testing.T) {
-	var n int32
+	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&n, 1) == 1 {
+		if n.Add(1) == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -166,15 +169,15 @@ func TestRetryOn503(t *testing.T) {
 	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err != nil {
 		t.Fatalf("want success after 503 retry, got %v", err)
 	}
-	if atomic.LoadInt32(&n) != 2 {
-		t.Fatalf("attempts = %d, want 2", n)
+	if n.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", n.Load())
 	}
 }
 
 func TestRetryAfterSecondsWaits(t *testing.T) {
-	var n int32
+	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&n, 1) == 1 {
+		if n.Add(1) == 1 {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
@@ -193,9 +196,9 @@ func TestRetryAfterSecondsWaits(t *testing.T) {
 }
 
 func TestNon429FourxxNotRetried(t *testing.T) {
-	var n int32
+	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&n, 1)
+		n.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 	}))
 	defer srv.Close()
@@ -203,8 +206,8 @@ func TestNon429FourxxNotRetried(t *testing.T) {
 	if err := c.do(context.Background(), http.MethodGet, "experiments/get", nil, nil); err == nil {
 		t.Fatal("want error on 400")
 	}
-	if atomic.LoadInt32(&n) != 1 {
-		t.Fatalf("400 must not retry, attempts = %d", n)
+	if n.Load() != 1 {
+		t.Fatalf("400 must not retry, attempts = %d", n.Load())
 	}
 }
 

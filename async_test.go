@@ -13,14 +13,14 @@ import (
 // batchSink is a fakeClient transport that records every runs/log-batch call.
 type batchSink struct {
 	mu         sync.Mutex
-	calls      int32
+	calls      atomic.Int32
 	metrics    map[string][]Metric
 	params     map[string][]Param
 	tags       map[string][]RunTag
-	batchSizes []int    // records len(metrics)+len(params)+len(tags) per call
-	fail       func() error // optional: return an error from each call
+	batchSizes []int      // records len(metrics)+len(params)+len(tags) per call
+	fail       func() error // optional: return an error from each call; guarded by mu
 	gate       chan struct{} // optional: if non-nil, first call blocks until closed
-	gated      int32
+	gated      atomic.Int32
 }
 
 func newBatchSink() *batchSink {
@@ -31,24 +31,32 @@ func newBatchSink() *batchSink {
 	}
 }
 
+// setFail safely sets the fail hook from a test goroutine.
+func (s *batchSink) setFail(f func() error) {
+	s.mu.Lock()
+	s.fail = f
+	s.mu.Unlock()
+}
+
 func (s *batchSink) client() *Client {
 	return fakeClient(func(method, path string, in, out any) error {
 		if path != "runs/log-batch" {
 			return nil
 		}
-		if s.gate != nil && atomic.AddInt32(&s.gated, 1) == 1 {
+		if s.gate != nil && s.gated.Add(1) == 1 {
 			<-s.gate
 		}
-		atomic.AddInt32(&s.calls, 1)
+		s.calls.Add(1)
 		req := in.(*logBatchReq)
 		s.mu.Lock()
 		s.metrics[req.RunID] = append(s.metrics[req.RunID], req.Metrics...)
 		s.params[req.RunID] = append(s.params[req.RunID], req.Params...)
 		s.tags[req.RunID] = append(s.tags[req.RunID], req.Tags...)
 		s.batchSizes = append(s.batchSizes, len(req.Metrics)+len(req.Params)+len(req.Tags))
+		failFn := s.fail
 		s.mu.Unlock()
-		if s.fail != nil {
-			return s.fail()
+		if failFn != nil {
+			return failFn()
 		}
 		return nil
 	})
@@ -158,7 +166,7 @@ func TestAsyncLoggerCoalescesBurst(t *testing.T) {
 		t.Fatalf("delivered %d, want 100", got)
 	}
 	// 100 records must coalesce into a handful of batches, not ~100.
-	if c := atomic.LoadInt32(&s.calls); c > 5 {
+	if c := s.calls.Load(); c > 5 {
 		t.Fatalf("expected coalesced batches, got %d log-batch calls", c)
 	}
 }
@@ -173,7 +181,7 @@ func TestAsyncLoggerCtxCancelWhenFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Wait until the worker is parked inside the flush gate.
-	for atomic.LoadInt32(&s.gated) == 0 {
+	for s.gated.Load() == 0 {
 		runtime.Gosched()
 	}
 	// Buffer (size 1) now empty; fill it.
@@ -224,9 +232,9 @@ func TestAsyncLoggerFlush(t *testing.T) {
 
 func TestAsyncLoggerErrorHandlerAndAggregate(t *testing.T) {
 	s := newBatchSink()
-	s.fail = func() error { return errors.New("boom") }
-	var handled int32
-	a := s.client().NewAsyncLogger(WithErrorHandler(func(error) { atomic.AddInt32(&handled, 1) }))
+	s.setFail(func() error { return errors.New("boom") })
+	var handled atomic.Int32
+	a := s.client().NewAsyncLogger(WithErrorHandler(func(error) { handled.Add(1) }))
 	if err := a.LogParam(context.Background(), "run1", "lr", "0.01"); err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +242,74 @@ func TestAsyncLoggerErrorHandlerAndAggregate(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("Close aggregate = %v, want it to contain boom", err)
 	}
-	if atomic.LoadInt32(&handled) == 0 {
+	if handled.Load() == 0 {
 		t.Fatal("error handler was never called")
+	}
+}
+
+// TestAsyncLoggerFlushPerCallErrors verifies that Flush reports only errors from
+// the current flush, not from earlier flushes, while Close still returns the full
+// aggregate.
+func TestAsyncLoggerFlushPerCallErrors(t *testing.T) {
+	boom := errors.New("boom")
+	s := newBatchSink()
+	s.setFail(func() error { return boom })
+	a := s.client().NewAsyncLogger()
+	ctx := context.Background()
+
+	// First flush: fail is set, so Flush must return an error containing boom.
+	if err := a.LogParam(ctx, "run1", "lr", "0.01"); err != nil {
+		t.Fatal(err)
+	}
+	err := a.Flush(ctx)
+	if err == nil || !errors.Is(err, boom) {
+		t.Fatalf("Flush (fail set) = %v, want error containing boom", err)
+	}
+
+	// Second flush: fail cleared, so Flush must return nil even though boom is
+	// still in a.errs from the first flush.
+	s.setFail(nil)
+	if err := a.LogMetric(ctx, "run1", "loss", 0.1, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Flush(ctx); err != nil {
+		t.Fatalf("Flush (fail cleared) = %v, want nil", err)
+	}
+
+	// Close returns the cumulative aggregate, which still contains boom.
+	if err := a.Close(); !errors.Is(err, boom) {
+		t.Fatalf("Close cumulative = %v, want error containing boom", err)
+	}
+}
+
+// TestAsyncLoggerConcurrentFlushRace stress-tests concurrent Flush calls against
+// a running logger to give the race detector coverage of the ack handshake.
+func TestAsyncLoggerConcurrentFlushRace(t *testing.T) {
+	s := newBatchSink()
+	a := s.client().NewAsyncLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	const flushers = 4
+	const iters = 30
+	var wg sync.WaitGroup
+	wg.Add(flushers)
+	for i := 0; i < flushers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				_ = a.Flush(ctx)
+			}
+		}()
+	}
+
+	for i := 0; i < 100; i++ {
+		_ = a.LogMetric(ctx, "run1", "loss", float64(i), 0, int64(i))
+	}
+
+	// Cancel first so any Flush blocked on <-ack can escape via ctx.Done().
+	cancel()
+	wg.Wait()
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
 	}
 }

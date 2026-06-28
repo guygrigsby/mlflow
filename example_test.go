@@ -77,8 +77,6 @@ func ExampleClient_LogMetric() {
 // ExampleAsyncLogger buffers metrics in a background worker and flushes them as
 // batch calls. The example enqueues 1000 metrics without blocking (the buffer
 // absorbs them), then Close flushes the remainder and returns any errors.
-// This example does not include // Output: so it compiles without executing,
-// avoiding network calls during go test.
 func ExampleAsyncLogger() {
 	c, err := mlflow.NewClient("https://mlflow.example.com", mlflow.WithBearerToken("tok"))
 	if err != nil {

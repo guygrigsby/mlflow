@@ -82,6 +82,11 @@ func NewClient(trackingURI string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
+// maxRetryAfter caps how long a server-provided Retry-After can pause a retry,
+// so a far-future or hostile header cannot park a caller (e.g. the AsyncLogger
+// worker, which retries on context.Background()) indefinitely.
+const maxRetryAfter = 60 * time.Second
+
 // doRequest performs the URL build, auth, and retry loop, returning the final
 // response body and status. It retries 429 and 5xx (and transport errors) up to
 // cfg.maxRetries, honoring Retry-After when present and using exponential backoff
@@ -182,23 +187,31 @@ func apiError(data []byte, status int) *APIError {
 }
 
 // parseRetryAfter interprets a Retry-After header value in either form:
-// delta-seconds ("5") or an HTTP-date. It returns the wait clamped to >= 0 and
-// whether the header was present and parseable. now is injected for testing.
+// delta-seconds ("5") or an HTTP-date. It returns the wait clamped to [0,
+// maxRetryAfter] and whether the header was present and parseable. now is
+// injected for testing.
 func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0, false
 	}
 	if secs, err := strconv.Atoi(v); err == nil {
-		if secs < 0 {
-			secs = 0
+		d := time.Duration(secs) * time.Second
+		if d < 0 {
+			d = 0
 		}
-		return time.Duration(secs) * time.Second, true
+		if d > maxRetryAfter {
+			d = maxRetryAfter
+		}
+		return d, true
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		d := t.Sub(now)
 		if d < 0 {
 			d = 0
+		}
+		if d > maxRetryAfter {
+			d = maxRetryAfter
 		}
 		return d, true
 	}

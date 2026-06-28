@@ -52,7 +52,9 @@ func WithBufferSize(n int) AsyncOption { return func(c *asyncConfig) { c.bufferS
 func WithBatchSize(n int) AsyncOption { return func(c *asyncConfig) { c.batchSize = n } }
 
 // WithErrorHandler is invoked once per failed background flush. Errors are also
-// aggregated and returned by Close.
+// aggregated and returned by Close. The handler runs synchronously on the
+// logger's background worker goroutine and MUST NOT call back into the same
+// logger (no Flush, Close, or blocking Log*): doing so will deadlock.
 func WithErrorHandler(h func(error)) AsyncOption { return func(c *asyncConfig) { c.onError = h } }
 
 // AsyncLogger buffers metric/param/tag writes and flushes them as runs/log-batch
@@ -71,7 +73,8 @@ type AsyncLogger struct {
 	errs      []error
 }
 
-// NewAsyncLogger starts a buffered logger over c. Call Close to flush and stop.
+// NewAsyncLogger starts a buffered logger over c. Call Close to flush and stop;
+// failing to call Close leaks the background worker goroutine.
 func (c *Client) NewAsyncLogger(opts ...AsyncOption) *AsyncLogger {
 	cfg := asyncConfig{bufferSize: 8192, batchSize: 1000}
 	for _, o := range opts {
@@ -110,6 +113,7 @@ func (a *AsyncLogger) recordErr(err error) {
 // run is the worker. It never waits on a clock: it blocks receiving the first
 // record, greedy-drains whatever else is queued, then flushes once it catches up.
 // Records are bucketed per run_id because runs/log-batch is per-run.
+// a.records is intentionally never closed; shutdown is signaled via a.closed.
 func (a *AsyncLogger) run() {
 	defer close(a.done)
 	buckets := map[string]*bucket{}
@@ -155,11 +159,7 @@ func (a *AsyncLogger) run() {
 	}
 	for {
 		select {
-		case rec, ok := <-a.records:
-			if !ok {
-				flushAll()
-				return
-			}
+		case rec := <-a.records:
 			feed(rec)
 		case <-a.closed:
 			a.drainAll(feed)
@@ -174,11 +174,7 @@ func (a *AsyncLogger) run() {
 		// greedy non-blocking drain, then flush once caught up
 		for draining := true; draining; {
 			select {
-			case rec, ok := <-a.records:
-				if !ok {
-					flushAll()
-					return
-				}
+			case rec := <-a.records:
 				feed(rec)
 			default:
 				draining = false
@@ -234,8 +230,13 @@ func (a *AsyncLogger) SetTag(ctx context.Context, runID, key, value string) erro
 
 // Flush force-flushes all records buffered at the time of the call and waits for
 // those batches to complete. Returns ctx.Err() if ctx is canceled while waiting,
-// ErrLoggerClosed if the logger is closed, otherwise the aggregate flush error so far.
+// ErrLoggerClosed if the logger is closed, otherwise only errors from this flush
+// (not prior flushes). Use Close to retrieve the full aggregate.
 func (a *AsyncLogger) Flush(ctx context.Context) error {
+	a.mu.Lock()
+	snap := len(a.errs)
+	a.mu.Unlock()
+
 	ack := make(chan struct{})
 	select {
 	case a.flushReq <- ack:
@@ -251,7 +252,7 @@ func (a *AsyncLogger) Flush(ctx context.Context) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return errors.Join(a.errs...)
+	return errors.Join(a.errs[snap:]...)
 }
 
 // Close flushes buffered records, stops the worker, and returns the aggregate of
