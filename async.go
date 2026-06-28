@@ -45,7 +45,8 @@ type AsyncOption func(*asyncConfig)
 func WithBufferSize(n int) AsyncOption { return func(c *asyncConfig) { c.bufferSize = n } }
 
 // WithBatchSize caps records per flush, clamped to [1,1000] (default 1000, the
-// API limit). Real batch size still tracks traffic via the greedy drain.
+// API limit). The greedy drain makes real batch size track traffic once the
+// size trigger is wired in (Task 4); until then this only sets the cap.
 func WithBatchSize(n int) AsyncOption { return func(c *asyncConfig) { c.batchSize = n } }
 
 // WithErrorHandler is invoked once per failed background flush. Errors are also
@@ -194,7 +195,9 @@ func (a *AsyncLogger) LogMetric(ctx context.Context, runID, key string, value fl
 }
 
 // Close flushes buffered records, stops the worker, and returns the aggregate of
-// all flush errors. Idempotent.
+// all flush errors. Idempotent. Callers must stop all Log* / Flush calls before
+// invoking Close: a Log* racing Close may enqueue a record the stopped worker
+// never drains. Records whose Log* returned before Close are always flushed.
 func (a *AsyncLogger) Close() error {
 	a.closeOnce.Do(func() { close(a.closed) })
 	<-a.done
